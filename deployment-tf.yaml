@@ -1,0 +1,304 @@
+# Terraform pipeline
+
+parameters:
+
+- name: tf_version
+  type: string
+  default: ''
+- name: tf_folder
+  type: string
+  default: $(Build.SourcesDirectory)/terraform/
+- name: backendAwsBucket
+  type: string
+  default: ''
+- name: account
+  type: string
+  default: ''
+- name: pool
+  type: string
+  default: 'ubuntu-latest'
+- name: environment
+  type: string
+  default: ''
+- name: INFRACOST_API_KEY
+  type: string
+  default: VjkK504hOZCgdpWAbliewNu9GUjgmf68
+- name: cost_increase_alert_percentage
+  type: string
+  default: 50
+    
+
+jobs:
+  - job: runCheckov
+    displayName: Scan Checkov Terraform.
+    pool:
+      vmImage: ${{ parameters.pool }}
+    steps:
+
+      - bash: |
+          docker pull bridgecrew/checkov
+        workingDirectory: ${{ parameters.tf_folder }}
+        displayName: "Pull > bridgecrew/checkov"
+
+      - bash: |
+          docker run --volume $(pwd):/tf bridgecrew/checkov --directory /tf --output junitxml --soft-fail > $(pwd)/CheckovReport.xml
+        workingDirectory: ${{ parameters.tf_folder }}
+        displayName: "Run > checkov"
+
+      - task: PublishTestResults@2
+        inputs:
+          testRunTitle: "Checkov Results"
+          failTaskOnFailedTests: false
+          testResultsFormat: "JUnit"
+          testResultsFiles: "CheckovReport.xml"
+          searchFolder: ${{ parameters.tf_folder }}
+        displayName: "Publish > Checkov scan results"
+
+#   # Validate Terraform - uses the following ...
+#   # https://marketplace.visualstudio.com/items?itemName=charleszipp.azure-pipelines-tasks-terraform
+#   ######################################################################
+
+#   # - stage: "validateTerraform"
+#   #   displayName: "Terraform - Validate"
+#   #   dependsOn:
+#   #     - "runCheckov"
+
+  - job: "ValidateTerraform"
+    dependsOn: "runCheckov"
+    displayName: "Terraform > install, init and validate"
+    continueOnError: false
+    steps:
+      - task:  TerraformInstaller@0
+        inputs:
+          terraformVersion: ${{ parameters.tf_version }}
+        displayName: "Install > terraform"
+
+      - task: TerraformCLI@0
+        inputs:
+          command: init
+          workingDirectory: '${{ parameters.tf_folder }}'
+          backendtType  : aws
+          backendServiceAws: '${{ parameters.account}}'
+          backendAwsRegion: 'us-east-1'
+          backendAwsBucket: ${{ parameters.backendAwsBucket}}
+          backendAwsKey: terraform
+        displayName: "Run > terraform init"
+
+      - task: TerraformCLI@0
+        inputs:
+          command: "validate"
+        displayName: "Run > terraform validate"
+
+  # # # Plan Terraform - uses the following ...
+  # # # https://marketplace.visualstudio.com/items?itemName=charleszipp.azure-pipelines-tasks-terraform
+  # # # Will set some variables to trigger a terrafrom apply automatically
+  # # # if there are just changes or ask for approval if there are any
+  # # # resouces which are being destroyed
+  # # ######################################################################
+
+  # # - stage: "planTerraform"
+  # #   displayName: "Terraform - Plan"
+  # #   dependsOn:
+  # #     - "validateTerraform"
+  #   # jobs:
+  - job: "TerraformInitPlan"
+    dependsOn: "ValidateTerraform"
+    displayName: "Terraform > install, init & plan"
+    steps:
+      - task: TerraformInstaller@0
+        inputs:
+          terraformVersion: ${{ parameters.tf_version }}
+        displayName: "Install > terraform"
+
+      - task: TerraformCLI@0
+        inputs:
+          command: init
+          workingDirectory: '${{ parameters.tf_folder }}'
+          backendtType  : aws
+          backendServiceAws: '${{ parameters.account}}'
+          backendAwsRegion: 'us-east-1'
+          backendAwsBucket: ${{ parameters.backendAwsBucket}}
+          backendAwsKey: terraform
+        displayName: "Run > terraform init"
+
+      - task: TerraformCLI@0
+        displayName: 'terraform plan'
+        inputs:
+          command: plan
+          workingDirectory: '${{ parameters.tf_folder }}'
+          commandOptions: "-out=${{ parameters.tf_folder }}/terraform.tfplan -detailed-exitcode"
+          publishPlanResults: '"PlanResults"'
+          providerServiceAws: '${{ parameters.account}}'
+          providerAwsRegion: 'us-east-1'
+        
+      
+      - task: TerraformCLI@0
+        displayName: "Run > terraform show"
+        inputs:
+          command: show
+          workingDirectory: '${{ parameters.tf_folder }}'
+          inputTargetPlanOrStateFilePath: '${{ parameters.tf_folder }}/terraform.tfplan'
+
+      - bash: |
+          if [ -z "${{ parameters.INFRACOST_API_KEY }}" ]; then
+            echo "ℹ️ - No Infracost API Key has been detected - skipping task"
+          else
+            sudo apt-get update -qq && sudo apt-get -qq install bc curl git jq bc
+            curl -sL https://github.com/infracost/infracost/releases/latest/download/infracost-linux-amd64.tar.gz | tar xz -C /tmp
+            sudo mv /tmp/infracost-linux-amd64 /usr/bin/infracost
+          fi
+        name: "installinfracost"
+        displayName: "Install > Infrascost"
+
+      - bash: |
+          if [ -z "${{ parameters.INFRACOST_API_KEY }}" ]; then
+            echo "ℹ️ - No Infracost API Key has been detected - skipping task"
+          else
+            mkdir ${{ parameters.tf_folder }}/output
+            terraform show -json ${{ parameters.tf_folder }}/terraform.tfplan > ${{ parameters.tf_folder }}/output/plan.json
+            infracost breakdown --format json --path ${{ parameters.tf_folder }}/output/plan.json > ${{ parameters.tf_folder }}/output/cost.json
+
+            past_total_monthly_cost=$(jq '[.projects[].pastBreakdown.totalMonthlyCost | select (.!=null) | tonumber] | add' ${{ parameters.tf_folder }}/output/cost.json)
+            total_monthly_cost=$(jq '[.projects[].breakdown.totalMonthlyCost | select (.!=null) | tonumber] | add' ${{ parameters.tf_folder }}/output/cost.json)
+            diff_cost=$(jq '[.projects[].diff.totalMonthlyCost | select (.!=null) | tonumber] | add' ${{ parameters.tf_folder }}/output/cost.json)
+            percentage_threshold='50' ##${{ parameters.cost_increase_alert_percentage }}
+
+            if [ $(echo "$past_total_monthly_cost > 0" | bc -l) = 1 ] && [ $(echo "$total_monthly_cost > 0" | bc -l) = 1 ]; then
+              percent=$(echo "scale=6; $total_monthly_cost / $past_total_monthly_cost * 100 - 100" | bc)
+            fi
+
+            if [ $(echo "$past_total_monthly_cost <= 0" | bc -l) = 1 ] && [ $(echo "$total_monthly_cost <= 0" | bc -l) = 1 ]; then
+              percent=0
+            fi
+
+            if [ -z "$percent" ]; then
+              echo "##vso[task.logissue type=warning]💰 - ℹ️ No previous cost data has been detected"
+            elif [ $(echo "$percent > $percentage_threshold" | bc -l) = 1 ]; then
+              echo "##vso[task.logissue type=warning]💰 - 📈 A $percent% increase in cost have be detected. Your monthly costs are increasing from \$$past_total_monthly_cost to \$$total_monthly_cost"
+              echo "##vso[task.setvariable variable=TERRAFORM_PLAN_HAS_DESTROY_CHANGES]true"
+            else
+              echo "##vso[task.logissue type=warning]💰 - 📉 An acceptable or no change in cost has been detected. Your new monthly costs are \$$total_monthly_cost from \$$past_total_monthly_cost"
+            fi
+          fi
+        env:
+          INFRACOST_API_KEY: ${{ parameters.INFRACOST_API_KEY }}
+        name: "runinfracost"
+        displayName: "Run > Infrascost"
+
+      - bash: |
+          if [ "$TERRAFORM_PLAN_HAS_CHANGES" = true ] && [ "$TERRAFORM_PLAN_HAS_DESTROY_CHANGES" = false ] ; then
+            echo "##vso[task.setvariable variable=HAS_CHANGES_ONLY;isOutput=true]true"
+            echo "##vso[task.logissue type=warning]👍 - Changes with no destroys detected, it is safe for the pipeline to proceed automatically"
+            fi
+          if [ "$TERRAFORM_PLAN_HAS_CHANGES" = true ] && [ "$TERRAFORM_PLAN_HAS_DESTROY_CHANGES" = true ] ; then
+            echo "##vso[task.setvariable variable=HAS_DESTROY_CHANGES;isOutput=true]true"
+            echo "##vso[task.logissue type=warning]⛔️ - Changes with Destroy or Cost increase, pipeline will require a manual approval to proceed"
+          fi
+          if [ "$TERRAFORM_PLAN_HAS_CHANGES" != true ] ; then
+            echo "##vso[task.logissue type=warning]ℹ️ - No changes detected, terraform apply will not run"
+          fi
+        name: "setvar"
+        displayName: "Vars > Set Variables for next stage"
+
+  # # # Auto Approval Terraform - uses the following ...
+  # # # https://marketplace.visualstudio.com/items?itemName=charleszipp.azure-pipelines-tasks-terraform
+  # # # Will run the terraform apply if there are are only changes and
+  # # # nothing to be destroyed
+  # # ######################################################################
+
+  # # - stage: "autoTerraform"
+  # #   displayName: "Terraform - Auto Approval"
+    
+  # jobs:
+  - job: "TerraformAuto"
+    displayName: "Terraform > install, init & apply"
+    dependsOn:
+      - "TerraformInitPlan"
+    condition: |
+      and
+        (
+          succeeded(),
+          eq(dependencies.TerraformInitPlan.outputs['setvar.HAS_CHANGES_ONLY'], 'true')
+        )
+    steps:
+      - task: TerraformInstaller@0
+        inputs:
+          terraformVersion: "${{ parameters.tf_version }}"
+        displayName: "Install > terraform"
+      
+      - task: TerraformCLI@0
+        inputs:
+          command: init
+          workingDirectory: '${{ parameters.tf_folder }}'
+          backendtType  : aws
+          backendServiceAws: '${{ parameters.account}}'
+          backendAwsRegion: 'us-east-1'
+          backendAwsBucket: ${{ parameters.backendAwsBucket}}
+          backendAwsKey: terraform
+        displayName: "Run > terraform init"
+
+      - task: TerraformCLI@0
+        displayName: "Run > terraform apply"  
+        inputs:
+          command: apply
+          workingDirectory: '${{ parameters.tf_folder }}'
+          providerServiceAws: '${{ parameters.account}}'
+          providerAwsRegion: 'us-east-1'
+
+  # # # Manual Approval Terraform - uses the following ...
+  # # # https://marketplace.visualstudio.com/items?itemName=charleszipp.azure-pipelines-tasks-terraform
+  # # # Will wait for changes to be approved if there are any resources
+  # # # which are  being destroyed
+  # # ######################################################################
+
+  # # - stage: "approveTerraform"
+  # # #   displayName: "Terraform - Manual Approval"
+    
+  #   # jobs:
+  - job: "waitForValidation"
+    dependsOn:
+      - "TerraformInitPlan"
+    condition: |
+      and
+        (
+          succeeded(),
+          eq(dependencies.TerraformInitPlan.outputs['setvar.HAS_DESTROY_CHANGES'], 'true')
+        )
+    displayName: "Wait > Wait for manual appoval"
+    pool: "server"
+    timeoutInMinutes: "4320" # job times out in 3 days
+    steps:
+      - task: ManualValidation@0
+        timeoutInMinutes: "1440" # task times out in 1 day
+        inputs:
+          notifyUsers: |
+            guzmanromerojesu11-b@hotmail.com
+          instructions: "There are resources being destroyed or the costs are increasing alot as part of this deployment, please review the output of Terraform plan before approving."
+          onTimeout: "reject"
+
+  - job: "TerraformApprove"
+    displayName: "Terraform > install, init & apply"
+    dependsOn: "waitForValidation"
+    steps:
+      - task: TerraformInstaller@0
+        inputs:
+          terraformVersion: ${{ parameters.tf_version }}
+        displayName: "Install > terraform"
+
+      - task: TerraformCLI@0
+        inputs:
+          command: init
+          workingDirectory: '${{ parameters.tf_folder }}'
+          backendtType  : aws
+          backendServiceAws: '${{ parameters.account}}'
+          backendAwsRegion: 'us-east-1'
+          backendAwsBucket: ${{ parameters.backendAwsBucket}}
+          backendAwsKey: terraform
+        displayName: "Run > terraform init"
+
+      - task: TerraformCLI@0
+        inputs:
+          command: apply
+          providerServiceAws: '${{ parameters.account}}'
+          providerAwsRegion: 'us-east-1'
+        displayName: "Run > terraform apply"

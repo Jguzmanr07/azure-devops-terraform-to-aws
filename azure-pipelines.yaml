@@ -1,0 +1,44 @@
+resources:
+  
+  repositories:
+  - repository: aw0000_cloud
+    type: git
+    ref: refs/heads/trunk
+    name: aw0000_cloud
+
+
+trigger:
+  branches:
+    include:
+      - trunk
+  paths:
+    include:
+      - terraform/*
+    exclude:
+      - backup/
+      - azure-pipelines.yaml
+
+stages:
+  - stage: deploy_cloud_dev
+    displayName: Deploy cloud dev
+    jobs:
+      - template: /job-template/deployment-tf.yaml@aw0000_cloud
+        parameters:
+          tf_version: 'latest'
+          account: aws-dev
+          backendAwsBucket: 'aw0000-cloud-include-templates-bucket2'
+          environment: 'dev'
+          # env_service_name_aws: terraform-aws-dev
+        #  name: '$(cloudformation-stack-name)-$(env)-sns'
+  
+  - stage: deploy_cloud_Qa
+    displayName: Deploy cloud Qa
+    jobs:
+      - template: /job-template/deployment-tf.yaml@aw0000_cloud
+        parameters:
+          tf_version: 'latest'
+          account: aws-dev
+          backendAwsBucket: 'aw0000-cloud-include-templates-bucket2'
+          environment: 'qa'
+          # env_service_name_aws: terraform-aws-dev
+        #  name: '$(cloudformation-stack-name)-$(env)-sns'
